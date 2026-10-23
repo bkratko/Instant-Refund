@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Rust
+sidecar-kaspa/target/
+
+# Secrets and local data -- never commit
+.env
+*.env
+!.env.example
+*secret*
+*api-keys*
+*.pem
+*.key
+*.db
+
+# Large artifacts
+*.tar.gz
+*.zip
+*.bak*

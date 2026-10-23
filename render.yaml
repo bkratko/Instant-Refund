@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: instant-refund
+    env: python
+    plan: basic
+    buildCommand: ""
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8080
+    envVars:
+      - key: KASPA_NETWORK
+        sync: false
+      - key: KASPA_REFUND_FROM_ADDRESS
+        sync: false
+      - key: SIGNER_SHARED_SECRET
+        sync: false
+
+  - type: web
+    name: instant-refund-signer
+    env: python
+    plan: basic
+    buildCommand: ""
+    startCommand: uvicorn app.signer_service:app --host 0.0.0.0 --port 8080
+    envVars:
+      - key: SIGNER_SHARED_SECRET
+        sync: false
