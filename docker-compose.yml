@@ -1,0 +1,58 @@
+# Instant Refund on Kaspa — single-droplet stack (testnet-10 by default).
+services:
+  kaspad:
+    image: kaspanet/rusty-kaspad:latest
+    restart: unless-stopped
+    command: >
+      kaspad --testnet --utxoindex --yes --appdir=/app/data
+      --rpclisten-borsh=0.0.0.0:17210 --ram-scale=0.5
+    volumes: ["kaspad-data:/app/data"]
+    ports: ["16211:16211"]          # testnet P2P, so the node can serve peers
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: instant_refund
+      POSTGRES_USER: ir
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
+    volumes: ["pg-data:/var/lib/postgresql/data"]
+    healthcheck: {test: ["CMD-SHELL", "pg_isready -U ir"], interval: 5s, retries: 10}
+
+  sidecar:
+    build: ./sidecar-kaspa
+    restart: unless-stopped
+    environment:
+      KASPA_NETWORK: ${KASPA_NETWORK:-testnet-10}
+      KASPAD_WRPC_URL: ws://kaspad:17210
+      KASPA_SETTLEMENT_PRIVKEY_FILE: /secrets/settlement.key
+      KASPA_EXPECTED_FROM_ADDRESS: ${KASPA_EXPECTED_FROM_ADDRESS:-}
+      SIGNER_SHARED_SECRET: ${SIGNER_SHARED_SECRET:?set in .env}
+      KASPA_CONFIRMATIONS_REQUIRED: ${KASPA_CONFIRMATIONS_REQUIRED:-10}
+    volumes: ["./secrets:/secrets:ro"]
+    depends_on: [kaspad]
+    # no published ports: only the worker and API reach it on the internal network
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://ir:${POSTGRES_PASSWORD}@postgres:5432/instant_refund
+      SIDECAR_URL: http://sidecar:8080
+    ports: ["80:8000"]
+    depends_on: {postgres: {condition: service_healthy}}
+
+  worker:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://ir:${POSTGRES_PASSWORD}@postgres:5432/instant_refund
+      SIDECAR_URL: http://sidecar:8080
+    depends_on: {postgres: {condition: service_healthy}, sidecar: {condition: service_started}}
+
+volumes:
+  kaspad-data:
+  pg-data:

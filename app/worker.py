@@ -1,201 +1,140 @@
-import logging
+"""Settlement worker.
 
-logger = logging.getLogger(__name__)
-import os
-import time
-import base64
-import json
-import hmac
+Loop:
+  1. Claim a queued job (FOR UPDATE SKIP LOCKED, so many workers can run safely).
+  2. Send the refund's commitment to the Rust sidecar as an HMAC-signed intent that
+     expires in 60 s. The sidecar signs and submits the Kaspa transaction; Python never
+     sees the key.
+  3. Poll broadcast anchors until they reach the required confirmations, then mark the
+     refund settled with its Kaspa txid and block DAA score.
+"""
+from __future__ import annotations
+
 import hashlib
+import hmac
+import json
+import logging
+import time
+
 import requests
-from datetime import datetime, timezone
 
-from app.db import connect, init_schema_if_possible
+from app import store
+from app.config import SIDECAR_URL, signer_secret
+from app.db import db_cursor, init_schema
+from app.models import RefundStatus
 
-POLL_SECONDS = int(os.getenv("WORKER_POLL_SECONDS", "2"))
+log = logging.getLogger("worker")
+POLL_SECONDS = 1.0
+MAX_ATTEMPTS = 8
+SECRET = b""
 
-SIGNER_URL = os.getenv("SIGNER_URL", "http://instant-refund-signer:8080")
-SIGNER_SHARED_SECRET = os.getenv("SIGNER_SHARED_SECRET", "")
 
-KASPA_NETWORK = os.getenv("KASPA_NETWORK", "testnet")
-KASPA_REFUND_FROM_ADDRESS = os.getenv("KASPA_REFUND_FROM_ADDRESS", "")
-KASPA_FEE_ATOMIC = int(os.getenv("KASPA_FEE_ATOMIC", "1000"))  # placeholder
+def _sign(body: bytes) -> str:
+    return hmac.new(SECRET, body, hashlib.sha256).hexdigest()
 
-def _hmac_hex(payload_bytes: bytes) -> str:
-    if not SIGNER_SHARED_SECRET:
-        raise RuntimeError("SIGNER_SHARED_SECRET is not set")
-    return hmac.new(SIGNER_SHARED_SECRET.encode("utf-8"), payload_bytes, hashlib.sha256).hexdigest()
 
-def claim_next_job():
-    sql = """
-    WITH next_job AS (
-      SELECT job_id
-      FROM settlement_jobs
-      WHERE state IN ('queued', 'failed_retryable')
-        AND next_run_at <= NOW()
-      ORDER BY next_run_at ASC, job_id ASC
-      FOR UPDATE SKIP LOCKED
-      LIMIT 1
-    )
-    UPDATE settlement_jobs j
-    SET state = 'processing',
-        locked_at = NOW(),
-        updated_at = NOW()
-    FROM next_job
-    WHERE j.job_id = next_job.job_id
-    RETURNING j.*;
-    """
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            row = cur.fetchone()
-        conn.commit()
-        return row
-
-def load_refund(refund_id: str):
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM refunds WHERE refund_id=%s", (refund_id,))
-            row = cur.fetchone()
-        return row
-
-def mark_retryable(job_id: int, error: str, backoff_seconds: int = 10):
-    sql = """
-    UPDATE settlement_jobs
-    SET state = 'failed_retryable',
-        attempts = attempts + 1,
-        next_run_at = NOW() + (%s || ' seconds')::interval,
-        last_error = %s,
-        updated_at = NOW()
-    WHERE job_id = %s;
-    """
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (backoff_seconds, error[:2000], job_id))
-        conn.commit()
-
-def mark_broadcast(job_id: int, refund_id: str, txid: str):
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE settlement_jobs
-                SET state = 'broadcast',
-                    last_error = NULL,
-                    updated_at = NOW()
-                WHERE job_id = %s;
-                """,
-                (job_id,)
+def claim_job():
+    with db_cursor() as (_, cur):
+        cur.execute("""
+            WITH next_job AS (
+              SELECT job_id FROM settlement_jobs
+              WHERE state IN ('queued', 'failed_retryable') AND next_run_at <= NOW()
+              ORDER BY next_run_at, job_id
+              FOR UPDATE SKIP LOCKED LIMIT 1
             )
-            cur.execute(
-                """
-                UPDATE refunds
-                SET settlement_state = 'broadcast',
-                    txid = %s,
-                    last_error = NULL
-                WHERE refund_id = %s;
-                """,
-                (txid, refund_id)
-            )
-        conn.commit()
+            UPDATE settlement_jobs j SET state='processing', locked_at=NOW(), updated_at=NOW()
+            FROM next_job WHERE j.job_id = next_job.job_id
+            RETURNING j.*
+        """)
+        return cur.fetchone()
 
-def build_unsigned_tx_stub(refund_row: dict) -> str:
-    """
-    v1 stub unsigned tx:
-    We encode a canonical JSON payload as base64 to validate the signer boundary flow.
-    Next step replaces this with real kaspad UTXO selection + tx bytes.
-    """
-    if not KASPA_REFUND_FROM_ADDRESS:
-        raise RuntimeError("KASPA_REFUND_FROM_ADDRESS is not set")
-    # In v1 stub we don't have a real customer address in DB yet. We'll add it later.
-    to_address = os.getenv("KASPA_REFUND_TEST_TO_ADDRESS", "")
-    if not to_address:
-        raise RuntimeError("KASPA_REFUND_TEST_TO_ADDRESS is not set")
 
-    amount_atomic = int(float(refund_row["amount"]) * 100000000)  # placeholder conversion
-    payload = {
-        "network": KASPA_NETWORK,
-        "from": KASPA_REFUND_FROM_ADDRESS,
-        "to": to_address,
-        "amount_atomic": amount_atomic,
-        "fee_atomic": KASPA_FEE_ATOMIC,
-        "refund_id": refund_row["refund_id"],
-    }
-    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    return base64.b64encode(raw).decode("utf-8")
-
-def sign_with_signer(job_id: int, refund_row: dict, unsigned_b64: str) -> str:
-    # create tx intent
-    now = int(time.time())
-    intent = {
-        "refund_id": refund_row["refund_id"],
-        "network": KASPA_NETWORK,
-        "from_address": KASPA_REFUND_FROM_ADDRESS,
-        "to_address": os.getenv("KASPA_REFUND_TEST_TO_ADDRESS", ""),
-        "amount_atomic": int(float(refund_row["amount"]) * 100000000),
-        "expires_at_unix": now + 60,
-        "idempotency_key": refund_row["refund_id"]
-    }
-
-    body = {
-        "job_id": int(job_id),
-        "tx_intent": intent,
-        "unsigned_tx_bytes_b64": unsigned_b64
-    }
-
-    canonical = (str(job_id) + "|" + json.dumps(intent, separators=(",", ":"), sort_keys=True) + "|" + unsigned_b64).encode("utf-8")
-    auth = _hmac_hex(canonical)
-
-    r = requests.post(
-        f"{SIGNER_URL}/internal/sign",
-        json=body,
-        headers={"X-Signer-Auth": auth},
-        timeout=10
-    )
+def anchor(job: dict) -> None:
+    refund = store.get_refund(job["refund_id"])
+    body = json.dumps({
+        "refund_id": refund["refund_id"],
+        "commitment_hex": refund["commitment"],
+        "expires_at_unix": int(time.time()) + 60,
+    }, separators=(",", ":"), sort_keys=True).encode()
+    r = requests.post(f"{SIDECAR_URL}/v1/anchor", data=body, timeout=45,
+                      headers={"Content-Type": "application/json", "X-Signer-Auth": _sign(body)})
     if r.status_code != 200:
-        raise RuntimeError(f"signer error {r.status_code}: {r.text}")
+        raise RuntimeError(f"sidecar {r.status_code}: {r.text[:500]}")
+    receipt = r.json()
 
-    data = r.json()
-    return data["signed_tx_bytes_b64"]
+    with db_cursor() as (_, cur):
+        cur.execute("UPDATE settlement_jobs SET state='broadcast', last_error=NULL, updated_at=NOW() WHERE job_id=%s",
+                    (job["job_id"],))
+        cur.execute("UPDATE refunds SET status=%s, kaspa_txid=%s, updated_at=NOW() WHERE refund_id=%s",
+                    (RefundStatus.PENDING_SETTLEMENT.value, receipt["txid"], refund["refund_id"]))
+        store.add_event(cur, refund["refund_id"], "BROADCAST", receipt)
+    log.info("anchored refund=%s txid=%s fee=%s", refund["refund_id"], receipt["txid"], receipt["fee_sompi"])
 
-def broadcast_stub_and_get_txid(signed_b64: str, job_id: int) -> str:
-    """
-    Stub txid: hash the signed payload to produce deterministic txid-like string.
-    Next step replaces with kaspad submit_transaction and returns real txid.
-    """
-    h = hashlib.sha256(signed_b64.encode("utf-8")).hexdigest()
-    return "txid_stub_" + h[:32]
 
-def main():
-    init_schema_if_possible()
-    logger.info("instant-refund-worker: started (delegated custody mode)")
+def fail(job: dict, error: str) -> None:
+    attempts = job["attempts"] + 1
+    final = attempts >= MAX_ATTEMPTS
+    with db_cursor() as (_, cur):
+        cur.execute("""
+            UPDATE settlement_jobs SET state=%s, attempts=%s, last_error=%s, updated_at=NOW(),
+                   next_run_at = NOW() + make_interval(secs => %s)
+            WHERE job_id=%s
+        """, ("failed" if final else "failed_retryable", attempts, error[:2000], min(10 * 2 ** (attempts - 1), 300),
+              job["job_id"]))
+        if final:
+            cur.execute("UPDATE refunds SET status=%s, updated_at=NOW() WHERE refund_id=%s",
+                        (RefundStatus.FAILED.value, job["refund_id"]))
+            store.add_event(cur, job["refund_id"], "FAILED", {"error": error[:500]})
+    log.warning("job=%s attempt=%s error=%s", job["job_id"], attempts, error)
 
+
+def confirm_broadcasts() -> None:
+    with db_cursor() as (_, cur):
+        cur.execute("""
+            SELECT j.job_id, r.refund_id, r.kaspa_txid FROM settlement_jobs j JOIN refunds r USING (refund_id)
+            WHERE j.state='broadcast' ORDER BY j.updated_at LIMIT 25
+        """)
+        rows = cur.fetchall()
+    for row in rows:
+        try:
+            s = requests.get(f"{SIDECAR_URL}/v1/anchor/{row['kaspa_txid']}", timeout=10).json()
+        except Exception as e:  # sidecar briefly down; try next loop
+            log.warning("status check failed txid=%s: %s", row["kaspa_txid"], e)
+            continue
+        if s.get("final_"):
+            with db_cursor() as (_, cur):
+                cur.execute("UPDATE settlement_jobs SET state='settled', updated_at=NOW() WHERE job_id=%s",
+                            (row["job_id"],))
+                cur.execute("""UPDATE refunds SET status=%s, kaspa_block_daa=%s, settled_at=NOW(), updated_at=NOW()
+                               WHERE refund_id=%s""",
+                            (RefundStatus.SETTLED.value, s["block_daa_score"], row["refund_id"]))
+                store.add_event(cur, row["refund_id"], "SETTLED", {
+                    "kaspa_tx_id": row["kaspa_txid"], "block_daa_score": s["block_daa_score"],
+                    "confirmations": s["confirmations"]})
+            log.info("settled refund=%s txid=%s confs=%s", row["refund_id"], row["kaspa_txid"], s["confirmations"])
+
+
+def main() -> None:
+    global SECRET
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    SECRET = signer_secret()
+    init_schema()
+    log.info("settlement worker started; sidecar=%s", SIDECAR_URL)
     while True:
         job = None
         try:
-            job = claim_next_job()
-            if not job:
-                time.sleep(POLL_SECONDS)
+            confirm_broadcasts()
+            job = claim_job()
+            if job:
+                anchor(job)
                 continue
-
-            refund_id = job["refund_id"]
-            refund = load_refund(refund_id)
-            if not refund:
-                raise RuntimeError(f"refund not found: {refund_id}")
-
-            unsigned_b64 = build_unsigned_tx_stub(refund)
-            signed_b64 = sign_with_signer(job["job_id"], refund, unsigned_b64)
-            txid = broadcast_stub_and_get_txid(signed_b64, job["job_id"])
-
-            mark_broadcast(job["job_id"], refund_id, txid)
-            logger.info(f"broadcasted (stub): job_id={job['job_id']} refund_id={refund_id} txid={txid}")
-
         except Exception as e:
-            if job and "job_id" in job:
-                mark_retryable(job["job_id"], str(e), backoff_seconds=10)
+            if job:
+                fail(job, str(e))
             else:
-                logger.info(f"worker error (no job claimed): {e}")
-            time.sleep(POLL_SECONDS)
+                log.exception("worker loop error")
+        time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
     main()

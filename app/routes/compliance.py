@@ -43,26 +43,10 @@ def compliance_report(
     with db_cursor() as (_, cur):
         cur.execute("""
             SELECT
-                r.refund_id,
-                r.merchant_id,
-                r.order_id,
-                r.customer_id,
-                r.amount,
-                r.status,
-                r.acquirer_id,
-                r.flow_position,
-                r.reason,
-                r.idempotency_key,
-                r.created_at,
-                r.updated_at,
-                r.settlement_reference,
-                se.payload_json->>'kaspa_tx_id'   AS kaspa_tx_id,
-                se.payload_json->>'confirmed_at'  AS kaspa_confirmed_at,
-                se.created_at                     AS settlement_event_at
+                r.refund_id, r.merchant_id, r.order_id, r.customer_id, r.amount, r.currency, r.status,
+                r.acquirer_id, r.flow_position, r.reason, r.idempotency_key, r.created_at, r.updated_at,
+                r.commitment, r.kaspa_txid, r.kaspa_block_daa, r.settled_at
             FROM refunds r
-            LEFT JOIN settlement_events se
-                ON se.refund_id = r.refund_id
-                AND se.event_type = 'SETTLED'
             WHERE r.merchant_id = %s
               AND r.created_at >= %s
               AND r.created_at <  %s
@@ -76,6 +60,8 @@ def compliance_report(
         for k, v in rec.items():
             if hasattr(v, "isoformat"):
                 rec[k] = v.isoformat()
+            elif v is not None and k == "amount":
+                rec[k] = f"{v:.2f}"
 
     summary = {
         "merchant_id":    merchant_id,
@@ -94,8 +80,7 @@ def compliance_report(
         output = io.StringIO()
         fields = ["refund_id","merchant_id","order_id","customer_id","amount","status",
                   "acquirer_id","flow_position","reason","idempotency_key","created_at",
-                  "updated_at","settlement_reference","kaspa_tx_id","kaspa_confirmed_at",
-                  "settlement_event_at"]
+                  "updated_at","currency","commitment","kaspa_txid","kaspa_block_daa","settled_at"]
         writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(records)

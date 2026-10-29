@@ -1,96 +1,79 @@
 from __future__ import annotations
-import os
 
 import secrets
 from typing import Optional
-from fastapi import Header, HTTPException, status
+
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+
+from app import store
+from app.commitment import payload_hex
+from app.config import API_KEYS, EXPLORER_TX_URL, KASPA_NETWORK
+from app.models import InstantRefundRequest, KaspaProof, RefundProof, RefundReceipt, RefundStatus
+
 
 async def require_api_key(x_api_key: Optional[str] = Header(None)) -> str:
-    valid_keys = [k.strip() for k in os.environ.get('API_KEYS','').split(',') if k.strip()]
-    if not x_api_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Missing X-API-Key header')
-    for vk in valid_keys:
-        if secrets.compare_digest(x_api_key.strip(), vk):
-            return x_api_key.strip()
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail='Invalid API key')
-
-from fastapi import APIRouter, Header, HTTPException
-from decimal import Decimal
-
-from ..models import InstantRefundRequest, RefundReceipt, RefundStatus, RefreshResponse
-from ..store import STORE
-from ..settlement.engine import process_pending_refunds
+    if x_api_key and any(secrets.compare_digest(x_api_key.strip(), k) for k in API_KEYS):
+        return x_api_key.strip()
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid X-API-Key")
 
 
 router = APIRouter(prefix="/v1/refunds", tags=["refunds"])
 
+MESSAGES = {
+    RefundStatus.CREATED: "Refund recorded. Anchoring to Kaspa now.",
+    RefundStatus.PENDING_SETTLEMENT: "Refund anchored on Kaspa; awaiting confirmations.",
+    RefundStatus.SETTLED: "Refund final: anchored and confirmed on Kaspa.",
+    RefundStatus.FAILED: "Refund anchoring failed; see settlement events.",
+}
 
-@router.post("/instant", response_model=RefundReceipt)
-def create_instant_refund(
-    payload: InstantRefundRequest,
-    idempotency_key: str | None = Header(default=None, convert_underscores=False),
-):
-    # Header wins if present
-    idem = idempotency_key or payload.idempotency_key
 
-    # Normalize amount to 2dp string
-    amt = Decimal(str(payload.amount)).quantize(Decimal("0.01"))
-    rec = STORE.create_refund(
-        merchant_id=payload.merchant_id,
-        order_id=payload.order_id,
-        customer_id=payload.customer_id,
-        amount=f"{amt:.2f}",
-        reason=payload.reason,
-        idempotency_key=idem,
+def _proof(row: dict) -> KaspaProof:
+    txid = row.get("kaspa_txid")
+    return KaspaProof(
+        network=KASPA_NETWORK,
+        txid=txid,
+        payload_hex=payload_hex(row["commitment"]),
+        block_daa_score=row.get("kaspa_block_daa"),
+        explorer_url=EXPLORER_TX_URL.format(txid=txid) if txid else None,
     )
 
-    receipt_msg = (
-        "Refund approved and initiated instantly. "
-        "Customer should see a pending credit shortly; final settlement will confirm."
-    )
 
+def _receipt(row: dict) -> RefundReceipt:
+    st = RefundStatus(row["status"])
     return RefundReceipt(
-        refund_id=rec.refund_id,
-        status=rec.status,
-        merchant_id=rec.merchant_id,
-        order_id=rec.order_id,
-        customer_id=rec.customer_id,
-        amount=rec.amount,
-        created_at=rec.created_at,
-        receipt_message=receipt_msg,
-        settlement_reference=rec.settlement_reference,
+        refund_id=row["refund_id"], status=st, merchant_id=row["merchant_id"], order_id=row["order_id"],
+        amount=row["amount"], currency=row["currency"], created_at=store.iso(row["created_at"]),
+        settled_at=store.iso(row.get("settled_at")), receipt_message=MESSAGES[st],
+        commitment=row["commitment"], kaspa=_proof(row),
     )
 
 
-@router.get("/{refund_id}", response_model=RefundReceipt)
+@router.post("/instant", response_model=RefundReceipt, dependencies=[Depends(require_api_key)])
+def create_instant_refund(payload: InstantRefundRequest,
+                          idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
+    row = store.create_refund(payload, idempotency_key or payload.idempotency_key)
+    return _receipt(row)
+
+
+@router.get("/{refund_id}", response_model=RefundReceipt, dependencies=[Depends(require_api_key)])
 def get_refund(refund_id: str):
-    rec = STORE.get_refund(refund_id)
-    if not rec:
+    row = store.get_refund(refund_id)
+    if not row:
         raise HTTPException(status_code=404, detail="refund not found")
+    return _receipt(row)
 
-    if rec.status == RefundStatus.SETTLED:
-        msg = "Refund settled successfully."
-    elif rec.status == RefundStatus.PENDING_SETTLEMENT:
-        msg = "Refund initiated; settlement pending."
-    elif rec.status == RefundStatus.FAILED:
-        msg = "Refund failed; review settlement logs."
-    else:
-        msg = "Refund created."
 
-    return RefundReceipt(
-        refund_id=rec.refund_id,
-        status=rec.status,
-        merchant_id=rec.merchant_id,
-        order_id=rec.order_id,
-        customer_id=rec.customer_id,
-        amount=rec.amount,
-        created_at=rec.created_at,
-        receipt_message=msg,
-        settlement_reference=rec.settlement_reference,
+@router.get("/{refund_id}/proof", response_model=RefundProof)
+def get_proof(refund_id: str):
+    """Public: the canonical record, its hash, and where that hash lives on Kaspa."""
+    row = store.get_refund(refund_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="refund not found")
+    return RefundProof(
+        record=store.record_for(row),
+        commitment=row["commitment"],
+        payload_hex=payload_hex(row["commitment"]),
+        kaspa=_proof(row),
+        how_to_verify=("SHA-256 the record as compact JSON with sorted keys; it must equal `commitment`. "
+                       "Open the Kaspa transaction: its payload must equal `payload_hex` (hex of 'IR1' + commitment)."),
     )
-
-
-@router.post("/refresh", response_model=RefreshResponse)
-def refresh():
-    updated = process_pending_refunds()
-    return RefreshResponse(updated=updated)

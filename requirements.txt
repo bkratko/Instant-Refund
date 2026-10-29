@@ -1,11 +1,6 @@
-fastapi
-uvicorn
-pydantic<2.0.0
-requests
-httpx
-psycopg2-binary
-ecdsa
-grpcio
-protobuf
-
-slowapi>=0.1.9
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+pydantic==2.11.4
+requests==2.32.3
+psycopg2-binary==2.9.10
+slowapi==0.1.9

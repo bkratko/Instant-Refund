@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Instant Refund on Kaspa — Live Demo</title>
+<style>
+  :root{--bg:#0b0f14;--panel:#121820;--line:#223040;--ink:#e8eef5;--quiet:#8a9bb0;--kas:#49eacb;--warn:#f2c14e;--bad:#ff6b6b}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif}
+  header{padding:28px 24px 8px;max-width:1100px;margin:auto}
+  h1{margin:0;font-size:24px;letter-spacing:.2px}
+  .sub{color:var(--quiet);margin-top:4px}
+  .net{display:inline-block;margin-left:8px;padding:2px 8px;border:1px solid var(--kas);border-radius:99px;color:var(--kas);font-size:12px;vertical-align:middle}
+  main{max-width:1100px;margin:auto;padding:16px 24px 48px;display:grid;grid-template-columns:360px 1fr;gap:20px}
+  @media (max-width:860px){main{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}
+  .card h2{margin:0 0 14px;font-size:13px;letter-spacing:1px;text-transform:uppercase;color:var(--quiet)}
+  label{display:block;font-size:13px;color:var(--quiet);margin:12px 0 6px}
+  input{width:100%;padding:11px 12px;border-radius:8px;border:1px solid var(--line);background:#0d131a;color:var(--ink);font-size:15px}
+  button{margin-top:18px;width:100%;padding:13px;border:0;border-radius:8px;background:var(--kas);color:#04221c;font-weight:700;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:wait}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all}
+  .wallet{margin-top:20px}
+  .kv{display:flex;justify-content:space-between;gap:12px;padding:7px 0;border-bottom:1px solid var(--line)}
+  .kv:last-child{border:0}
+  .kv span:first-child{color:var(--quiet)}
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:18px}
+  .step{border:1px solid var(--line);border-radius:10px;padding:14px;min-height:92px}
+  .step b{display:block;font-size:14px}
+  .step small{color:var(--quiet)}
+  .step .t{font-size:22px;font-weight:700;margin-top:6px;font-variant-numeric:tabular-nums}
+  .step.on{border-color:var(--kas);box-shadow:0 0 0 1px var(--kas) inset}
+  .step.wait{border-color:var(--warn)}
+  .compare{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px}
+  .lane{border-radius:10px;padding:14px;border:1px solid var(--line)}
+  .lane.old{border-color:#5a2b2b}.lane.new{border-color:#1f5a4f}
+  .lane .big{font-size:26px;font-weight:800}
+  .lane.old .big{color:var(--bad)}.lane.new .big{color:var(--kas)}
+  .verify{margin-top:16px;padding:14px;border-radius:10px;border:1px dashed var(--line)}
+  .ok{color:var(--kas);font-weight:700}.no{color:var(--bad);font-weight:700}
+  a{color:var(--kas)}
+  .empty{color:var(--quiet);padding:40px 0;text-align:center}
+  footer{max-width:1100px;margin:auto;padding:0 24px 32px;color:var(--quiet);font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Instant Refund on Kaspa <span class="net" id="net">testnet</span></h1>
+  <div class="sub">Issue a refund. Watch it get a final, publicly verifiable settlement record on the Kaspa blockDAG in seconds.</div>
+</header>
+<main>
+  <section>
+    <div class="card">
+      <h2>Merchant console</h2>
+      <label for="order">Order ID</label>
+      <input id="order" placeholder="auto-generated if blank" maxlength="64">
+      <label for="amount">Refund amount (USD)</label>
+      <input id="amount" type="number" min="0.01" max="500" step="0.01" value="42.50">
+      <button id="go">Issue instant refund</button>
+    </div>
+    <div class="card wallet">
+      <h2>Settlement signer</h2>
+      <div class="kv"><span>Address</span><span class="mono" id="addr">…</span></div>
+      <div class="kv"><span>Balance</span><span id="bal">…</span></div>
+      <div class="kv"><span>Node synced</span><span id="sync">…</span></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <h2>Settlement record</h2>
+    <div id="empty" class="empty">No refund yet. Issue one on the left.</div>
+    <div id="view" hidden>
+      <div class="steps">
+        <div class="step" id="s1"><b>Recorded</b><small>ledger + commitment</small><div class="t" id="t1">—</div></div>
+        <div class="step" id="s2"><b>Anchored</b><small>signed tx on Kaspa</small><div class="t" id="t2">—</div></div>
+        <div class="step" id="s3"><b>Final</b><small>confirmed in the DAG</small><div class="t" id="t3">—</div></div>
+      </div>
+      <div class="compare">
+        <div class="lane old"><small>Card / ACH settlement</small><div class="big">3–5 days</div><small>no shared record until then</small></div>
+        <div class="lane new"><small>Kaspa settlement record</small><div class="big" id="elapsed">0.0 s</div><small id="elapsedNote">and counting</small></div>
+      </div>
+      <div class="kv"><span>Refund ID</span><span class="mono" id="rid"></span></div>
+      <div class="kv"><span>Order / amount</span><span id="oa"></span></div>
+      <div class="kv"><span>Commitment (SHA-256)</span><span class="mono" id="cm"></span></div>
+      <div class="kv"><span>Kaspa transaction</span><span class="mono" id="tx">pending…</span></div>
+      <div class="kv"><span>Block DAA score</span><span id="daa">—</span></div>
+      <div class="verify" id="verify">Independent verification runs once the refund is final.</div>
+    </div>
+  </section>
+</main>
+<footer>On-chain payload = <span class="mono">"IR1" + SHA-256(refund record)</span>. No customer or card data ever goes on-chain. Card and ACH rails still move the money; Kaspa carries the proof.</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+let current = null, t0 = 0, timer = null, poll = null;
+
+async function wallet(){
+  try{
+    const w = await (await fetch('/demo/wallet')).json();
+    $('addr').textContent = w.address; $('net').textContent = w.network;
+    $('bal').textContent = (w.balance_sompi/1e8).toLocaleString(undefined,{maximumFractionDigits:4}) + ' KAS';
+    $('sync').textContent = w.node_synced ? 'yes' : 'syncing…';
+  }catch(e){ $('sync').textContent = 'signer offline'; }
+}
+
+const secs = () => ((performance.now()-t0)/1000).toFixed(1)+' s';
+
+function render(r){
+  $('empty').hidden = true; $('view').hidden = false;
+  $('rid').textContent = r.refund_id;
+  $('oa').textContent = `${r.order_id} · $${Number(r.amount).toFixed(2)} ${r.currency}`;
+  $('cm').textContent = r.commitment;
+  const tx = r.kaspa.txid;
+  $('tx').innerHTML = tx ? `<a href="${r.kaspa.explorer_url}" target="_blank" rel="noopener">${tx}</a>` : 'pending…';
+  $('daa').textContent = r.kaspa.block_daa_score ?? '—';
+  $('s1').className = 'step on'; if(!$('t1').dataset.set){ $('t1').textContent = secs(); $('t1').dataset.set = 1; }
+  if(tx){ $('s2').className = 'step on'; if(!$('t2').dataset.set){ $('t2').textContent = secs(); $('t2').dataset.set = 1; } }
+  else $('s2').className = 'step wait';
+  if(r.status === 'settled'){
+    $('s3').className = 'step on'; $('t3').textContent = secs();
+    clearInterval(timer); clearInterval(poll);
+    $('elapsedNote').textContent = 'final and verifiable';
+    verify(r);
+  } else if(r.status === 'failed'){
+    clearInterval(timer); clearInterval(poll); $('s3').className = 'step'; $('t3').textContent = 'failed';
+  } else $('s3').className = tx ? 'step wait' : 'step';
+}
+
+async function verify(r){
+  const p = await (await fetch(`/v1/refunds/${r.refund_id}/proof`)).json();
+  const keys = Object.keys(p.record).sort(), obj = {}; keys.forEach(k => obj[k] = p.record[k]);
+  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(obj)));
+  const hex = [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,'0')).join('');
+  const ok = hex === p.commitment && p.payload_hex === '495231' + hex;
+  $('verify').innerHTML = (ok ? '<span class="ok">✓ Verified in your browser.</span> ' : '<span class="no">✗ Mismatch.</span> ')
+    + `SHA-256 of the refund record equals the commitment, and the commitment is the payload of Kaspa transaction `
+    + `<a href="${p.kaspa.explorer_url}" target="_blank" rel="noopener">${p.kaspa.txid.slice(0,16)}…</a>.`;
+}
+
+$('go').onclick = async () => {
+  const amount = parseFloat($('amount').value);
+  if(!(amount > 0 && amount <= 500)) return alert('Amount must be between $0.01 and $500.');
+  $('go').disabled = true; clearInterval(timer); clearInterval(poll);
+  ['t1','t2','t3'].forEach(i => { $(i).textContent = '—'; delete $(i).dataset.set; });
+  $('verify').textContent = 'Independent verification runs once the refund is final.';
+  t0 = performance.now();
+  timer = setInterval(() => $('elapsed').textContent = secs(), 100);
+  try{
+    const res = await fetch('/demo/refund', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({order_id: $('order').value, amount})});
+    if(!res.ok) throw new Error(await res.text());
+    current = await res.json(); render(current);
+    poll = setInterval(async () => { current = await (await fetch(`/demo/refund/${current.refund_id}`)).json(); render(current); }, 1000);
+  }catch(e){ clearInterval(timer); alert('Refund failed: ' + e.message); }
+  finally{ $('go').disabled = false; wallet(); }
+};
+
+wallet(); setInterval(wallet, 15000);
+</script>
+</body>
+</html>

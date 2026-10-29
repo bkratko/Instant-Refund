@@ -9,95 +9,70 @@ Instant Refund leaves the existing rails moving the money and anchors each refun
 ## Architecture
 
 ```
- Merchant / POS ──► Refund API (FastAPI) ──► Postgres ledger ──► Compliance export
-                                                │        │        (refund → Kaspa tx id)
-                                    settlement jobs   pending intents
-                                                ▼        ▼
- Settlement worker ──► Signer gateway (HMAC) ──► Rust Kaspa sidecar ──► kaspad (gRPC)
-                                                 holds the only key
+ Merchant / PayFac ──► Refund API (FastAPI) ──► Postgres ledger ──► Compliance export
+                                                     │                (refund → Kaspa txid)
+                                               settlement_jobs
+                                                     ▼
+                     Settlement worker ──HMAC intent──► Rust Kaspa sidecar ──wRPC──► kaspad
+                     (row-locked queue)   (60 s expiry)   holds the only key        (testnet-10)
 ```
 
 | Component | Responsibility | Path |
 | --- | --- | --- |
-| Refund API | Accepts refunds, enforces idempotency, returns receipts, serves compliance reports | `app/main.py`, `app/api.py`, `app/routes/` |
-| Ledger | System of record: refunds, signed intents, settlement events, settlement jobs | `app/db.py`, `app/store.py`, `app/migrate.py` |
-| Settlement worker | Claims jobs with row locks, builds intents, requests signatures, records broadcasts | `app/worker.py`, `app/settlement/` |
-| Signer gateway | Authenticates intents with a shared secret, hands off to the sidecar | `app/signer_service.py` |
-| Kaspa sidecar | Loads the settlement key, binds it to the mainnet address, signs and submits | `sidecar-kaspa/` |
-
-The signing key never leaves the Rust sidecar. Python only passes HMAC-authenticated intents that expire after 60 seconds.
-
-## Refund lifecycle
-
-```
-created ──job claimed──► pending_settlement ──confirmed──► settled
-                               │   ▲
-                               │   └── error: retry after 10 s backoff
-                               └──unrecoverable──► failed
-```
-
-Every transition writes a row to `settlement_events`, so each refund carries its full audit history.
+| Refund API | Accepts refunds (API key, idempotency), receipts, public proofs, compliance export | `app/main.py`, `app/routes/` |
+| Ledger | Refunds, settlement events, settlement jobs | `app/db.py`, `app/store.py` |
+| Commitment | `SHA-256` of the canonical refund record; only this hash goes on-chain | `app/commitment.py` |
+| Settlement worker | Claims jobs with `FOR UPDATE SKIP LOCKED`, sends HMAC-signed intents, tracks confirmations | `app/worker.py` |
+| Kaspa sidecar (Rust) | Binds the key to its address, builds/signs/submits the anchor tx, reports acceptance | `sidecar-kaspa/` |
+| Demo console | Live merchant demo with in-browser proof verification | `demo/index.html`, `app/routes/demo.py` |
 
 ## How a refund reaches the DAG
 
-1. **Idempotent create.** `POST /v1/refunds/instant`. A unique index on `(merchant_id, idempotency_key)` makes a retried request return the original refund.
-2. **Job claim.** Workers drain `settlement_jobs` with `FOR UPDATE SKIP LOCKED`, so any number of them can run in parallel without touching the same refund.
-3. **Signed intent.** The worker sends `{refund_id, network, from, to, amount_sompi, expires_at_unix, idempotency_key}` to the signer, authenticated with `HMAC-SHA256(secret, job_id | canonical_json(intent) | unsigned_tx_b64)`.
-4. **Key binding.** At startup the sidecar derives the x-only Schnorr key, builds the mainnet address with `kaspa-addresses`, and refuses to bind if it doesn't match `KASPA_EXPECTED_FROM_ADDRESS` (`sidecar-kaspa/src/settlement_key.rs`).
-5. **Sign and submit.** Each input is signed with `kaspa_consensus_core::sign::sign_input` (`SigHashType::All`) and submitted with kaspad `submit_transaction` (`sidecar-kaspa/src/kaspa/submit_signed.rs`).
+1. **Record.** `POST /v1/refunds/instant` writes the refund, its commitment and a settlement job in one Postgres transaction. A unique `(merchant_id, idempotency_key)` index makes retries return the original refund.
+2. **Claim.** The worker claims the job with `FOR UPDATE SKIP LOCKED`.
+3. **Intent.** It posts `{refund_id, commitment_hex, expires_at_unix}` to the sidecar with `X-Signer-Auth: hex(HMAC-SHA256(secret, body))`. Intents expire after 60 s.
+4. **Anchor.** The sidecar (Rust, `kaspa-wallet-core` 2.1) builds one transaction from the settlement address back to itself with payload `"IR1" ‖ commitment`, signs it with Schnorr, and submits it to kaspad over wRPC (Borsh). Only the network fee (~0.002 KAS) is spent.
+5. **Finalize.** The worker polls the sidecar until the transaction is accepted and has `KASPA_CONFIRMATIONS_REQUIRED` DAA confirmations, then marks the refund `settled` with its txid and block DAA score.
+
+## Verifying a refund without trusting us
+
+`GET /v1/refunds/{id}/proof` returns the canonical record, its commitment and the Kaspa txid.
+
+```python
+import hashlib, json
+h = hashlib.sha256(json.dumps(record, separators=(",", ":"), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+assert h == proof["commitment"]
+# Open the txid on a Kaspa explorer: its payload must be hex("IR1") + h
+```
 
 ## API
 
-| Method | Path | Purpose |
-| --- | --- | --- |
-| POST | `/v1/refunds/instant` | Create a refund (idempotent), return a receipt |
-| GET | `/v1/refunds/{refund_id}` | Status and receipt for one refund |
-| POST | `/v1/refunds/refresh` | Advance pending refunds through the settlement engine |
-| GET | `/v1/compliance/report` | PCI DSS / SOX reconciliation per merchant and period (JSON or CSV), keyed to Kaspa tx IDs. Requires `X-API-Key` |
+| Method | Path | Auth | Purpose |
+| --- | --- | --- | --- |
+| POST | `/v1/refunds/instant` | `X-API-Key` | Create a refund (honours `Idempotency-Key`) |
+| GET | `/v1/refunds/{refund_id}` | `X-API-Key` | Status, commitment, Kaspa txid |
+| GET | `/v1/refunds/{refund_id}/proof` | public | Record + commitment + txid for independent verification |
+| GET | `/v1/compliance/report` | `X-API-Key` | PCI DSS / SOX reconciliation per merchant and period (JSON or CSV) |
 
 ```json
 POST /v1/refunds/instant
-{
-  "merchant_id": "M-8821",
-  "order_id": "ORD-100245",
-  "customer_id": "C-55710",
-  "amount": "42.50",
-  "reason": "item returned",
-  "idempotency_key": "ord-100245-r1",
-  "acquirer_id": "ACQ-01",
-  "flow_position": "post_auth"
-}
+{"merchant_id": "M-8821", "order_id": "ORD-100245", "customer_id": "C-55710",
+ "amount": "42.50", "currency": "USD", "acquirer_id": "ACQ-01", "flow_position": "post_auth"}
 ```
 
-## Status
+## Deploy (one droplet)
 
-| Layer | State |
-| --- | --- |
-| Refund API, Postgres ledger, job queue | Working |
-| Compliance export | Working |
-| Signer boundary (HMAC intents) | Working |
-| Sidecar key load + mainnet address binding | Working |
-| On-chain leg (UTXO selection, signing, `submit_transaction`) | Written in `submit_signed.rs`; wiring into the running sidecar is the current milestone. The worker currently exercises the path with a stand-in transaction (`build_unsigned_tx_stub`, `broadcast_stub_and_get_txid`). |
-
-Next: real UTXO selection and change output, a public-key push in the signature script, sompi conversion from a quoted rate, confirmation tracking by txid, and the API-key check on `/v1/refunds/*`.
-
-## Running locally
+Ubuntu 24.04, 4 vCPU / 8 GB RAM / 160 GB disk. As root:
 
 ```bash
-cp .env.example .env          # fill in values
-pip install -r requirements.txt
-uvicorn app.main:app --port 8080          # API
-uvicorn app.signer_service:app --port 8001 # signer gateway
-python -m app.worker                       # settlement worker
-
-cd sidecar-kaspa && cargo build --release  # Linux; Windows builds a dev stub for key binding
+curl -fsSL https://raw.githubusercontent.com/bkratko/Instant-Refund/main/scripts/bootstrap.sh | bash
 ```
 
-Postgres tables are created at startup; run `python -m app.migrate` once for the acquirer and flow-position columns.
+This installs Docker, generates secrets into `.env`, creates the settlement key **on the server** (`scripts/keygen.sh`), and starts kaspad (testnet-10), Postgres, the sidecar, the API and the worker with `docker compose`. Fund the printed `kaspatest:` address from a testnet faucet; anchors confirm once kaspad has synced. The demo console is served at `http://<droplet-ip>/` when `DEMO_MODE=true`.
 
 ## Stack
 
-Python 3.11 · FastAPI · Pydantic 1.x · PostgreSQL · psycopg2 · slowapi · Rust 2021 · Tokio · Axum 0.7 · secp256k1 0.29 · kaspa-addresses · kaspa-consensus-core · kaspa-txscript · tokio-postgres · Docker · DigitalOcean App Platform
+Python 3.12 · FastAPI · Pydantic 2 · PostgreSQL 16 · Rust 2021 · Tokio · Axum 0.7 · kaspa-wallet-core / kaspa-wrpc-client 2.1 · secp256k1 Schnorr · rusty-kaspa node · Docker Compose · DigitalOcean
 
 ## Author
 

@@ -1,188 +1,73 @@
+"""Ledger operations. A refund and its settlement job are written in one transaction."""
 from __future__ import annotations
 
 import json
 import uuid
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional, List
+from typing import Any, Optional
 
-from .db import db_cursor, init_schema
-from .models import RefundStatus
+from app.commitment import canonical_record, commitment_hex
+from app.db import db_cursor
+from app.models import InstantRefundRequest, RefundStatus
 
-
-@dataclass
-class RefundRecord:
-    refund_id: str
-    merchant_id: str
-    order_id: str
-    customer_id: str
-    amount: str
-    reason: Optional[str]
-    idempotency_key: Optional[str]
-    status: RefundStatus
-    created_at: str
-    updated_at: str
-    settlement_reference: Optional[str]
+TS_FMT = "%Y-%m-%dT%H:%M:%SZ"
 
 
-class Store:
-    def __init__(self) -> None:
-        # Ensure schema exists at import time (DO startup hooks can be unreliable).
-        init_schema()
+def iso(ts: Optional[datetime]) -> Optional[str]:
+    return ts.astimezone(timezone.utc).strftime(TS_FMT) if ts else None
 
-    def _row_to_record(self, row: dict) -> RefundRecord:
-        return RefundRecord(
-            refund_id=row["refund_id"],
-            merchant_id=row["merchant_id"],
-            order_id=row["order_id"],
-            customer_id=row["customer_id"],
-            amount=row["amount"],
-            reason=row.get("reason"),
-            idempotency_key=row.get("idempotency_key"),
-            status=RefundStatus(row["status"]),
-            created_at=row["created_at"].isoformat() if hasattr(row["created_at"], "isoformat") else str(row["created_at"]),
-            updated_at=row["updated_at"].isoformat() if hasattr(row["updated_at"], "isoformat") else str(row["updated_at"]),
-            settlement_reference=row.get("settlement_reference"),
+
+def record_for(row: dict) -> dict:
+    return canonical_record(row["refund_id"], row["merchant_id"], row["order_id"], row["amount"],
+                            row["currency"], iso(row["created_at"]))
+
+
+def create_refund(req: InstantRefundRequest, idempotency_key: Optional[str]) -> dict:
+    """Create the refund + its anchor job. A repeated idempotency key returns the original."""
+    with db_cursor() as (_, cur):
+        if idempotency_key:
+            cur.execute("SELECT * FROM refunds WHERE merchant_id=%s AND idempotency_key=%s",
+                        (req.merchant_id, idempotency_key))
+            existing = cur.fetchone()
+            if existing:
+                return existing
+
+        refund_id = str(uuid.uuid4())
+        created_at = datetime.now(timezone.utc).replace(microsecond=0)
+        amount = req.amount.quantize(req.amount.__class__("0.01"))
+        commitment = commitment_hex(canonical_record(
+            refund_id, req.merchant_id, req.order_id, amount, req.currency, created_at.strftime(TS_FMT)))
+
+        cur.execute(
+            """
+            INSERT INTO refunds (refund_id, merchant_id, order_id, customer_id, amount, currency, reason,
+                                 idempotency_key, acquirer_id, flow_position, status, commitment, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (merchant_id, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+            RETURNING *
+            """,
+            (refund_id, req.merchant_id, req.order_id, req.customer_id, amount, req.currency.upper(), req.reason,
+             idempotency_key, req.acquirer_id, req.flow_position.value, RefundStatus.CREATED.value, commitment,
+             created_at, created_at),
         )
+        row = cur.fetchone()
+        if row is None:  # lost an idempotency race; return the winner
+            cur.execute("SELECT * FROM refunds WHERE merchant_id=%s AND idempotency_key=%s",
+                        (req.merchant_id, idempotency_key))
+            return cur.fetchone()
 
-    def create_refund(
-        self,
-        merchant_id: str,
-        order_id: str,
-        customer_id: str,
-        amount: str,
-        reason: Optional[str],
-        idempotency_key: Optional[str],
-    ) -> RefundRecord:
-        """Create refund record. If idempotency hits, return existing row."""
-        with db_cursor() as (conn, cur):
-            if idempotency_key:
-                cur.execute(
-                    """
-                    SELECT * FROM refunds
-                    WHERE merchant_id = %s AND idempotency_key = %s
-                    LIMIT 1;
-                    """,
-                    (merchant_id, idempotency_key),
-                )
-                existing = cur.fetchone()
-                if existing:
-                    return self._row_to_record(existing)
-
-            refund_id = str(uuid.uuid4())
-            now = datetime.now(timezone.utc)
-
-            cur.execute(
-                """
-                INSERT INTO refunds (
-                  refund_id, merchant_id, order_id, customer_id, amount, reason,
-                  idempotency_key, status, created_at, updated_at, settlement_reference
-                ) VALUES (
-                  %s,%s,%s,%s,%s,%s,
-                  %s,%s,%s,%s,%s
-                )
-                RETURNING *;
-                """,
-                (
-                    refund_id,
-                    merchant_id,
-                    order_id,
-                    customer_id,
-                    amount,
-                    reason,
-                    idempotency_key,
-                    RefundStatus.CREATED.value,
-                    now,
-                    now,
-                    None,
-                ),
-            )
-            row = cur.fetchone()
-
-            # Initial event log
-            cur.execute(
-                """
-                INSERT INTO settlement_events (refund_id, event_type, payload_json)
-                VALUES (%s, %s, %s);
-                """,
-                (refund_id, "CREATED", json.dumps({"note": "refund created"})),
-            )
-
-            return self._row_to_record(row)
-
-    def get_refund(self, refund_id: str) -> Optional[RefundRecord]:
-        with db_cursor() as (conn, cur):
-            cur.execute("SELECT * FROM refunds WHERE refund_id = %s LIMIT 1;", (refund_id,))
-            row = cur.fetchone()
-            return self._row_to_record(row) if row else None
-
-    def list_pending_for_settlement(self, limit: int = 50) -> List[RefundRecord]:
-        with db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                SELECT * FROM refunds
-                WHERE status IN (%s, %s)
-                ORDER BY created_at ASC
-                LIMIT %s;
-                """,
-                (RefundStatus.CREATED.value, RefundStatus.PENDING_SETTLEMENT.value, limit),
-            )
-            rows = cur.fetchall() or []
-            return [self._row_to_record(r) for r in rows]
-
-    def mark_pending_settlement(self, refund_id: str, settlement_reference: Optional[str]) -> None:
-        with db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                UPDATE refunds
-                SET status = %s,
-                    settlement_reference = COALESCE(%s, settlement_reference),
-                    updated_at = NOW()
-                WHERE refund_id = %s;
-                """,
-                (RefundStatus.PENDING_SETTLEMENT.value, settlement_reference, refund_id),
-            )
-
-    def mark_settled(self, refund_id: str) -> None:
-        with db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                UPDATE refunds
-                SET status = %s,
-                    updated_at = NOW()
-                WHERE refund_id = %s;
-                """,
-                (RefundStatus.SETTLED.value, refund_id),
-            )
-
-    def mark_failed(self, refund_id: str, reason: str) -> None:
-        with db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                UPDATE refunds
-                SET status = %s,
-                    updated_at = NOW()
-                WHERE refund_id = %s;
-                """,
-                (RefundStatus.FAILED.value, refund_id),
-            )
-            cur.execute(
-                """
-                INSERT INTO settlement_events (refund_id, event_type, payload_json)
-                VALUES (%s, %s, %s);
-                """,
-                (refund_id, "FAILED", json.dumps({"reason": reason})),
-            )
-
-    def add_settlement_event(self, refund_id: str, event_type: str, payload: Optional[dict[str, Any]] = None) -> None:
-        with db_cursor() as (conn, cur):
-            cur.execute(
-                """
-                INSERT INTO settlement_events (refund_id, event_type, payload_json)
-                VALUES (%s, %s, %s);
-                """,
-                (refund_id, event_type, json.dumps(payload or {})),
-            )
+        cur.execute("INSERT INTO settlement_jobs (refund_id) VALUES (%s)", (refund_id,))
+        cur.execute("INSERT INTO settlement_events (refund_id, event_type, payload_json) VALUES (%s,'CREATED',%s)",
+                    (refund_id, json.dumps({"commitment": commitment})))
+        return row
 
 
-STORE = Store()
+def get_refund(refund_id: str) -> Optional[dict]:
+    with db_cursor() as (_, cur):
+        cur.execute("SELECT * FROM refunds WHERE refund_id=%s", (refund_id,))
+        return cur.fetchone()
+
+
+def add_event(cur, refund_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    cur.execute("INSERT INTO settlement_events (refund_id, event_type, payload_json) VALUES (%s,%s,%s)",
+                (refund_id, event_type, json.dumps(payload)))
